@@ -5,19 +5,18 @@ import {ITrap} from "contracts/interfaces/ITrap.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-/// @title HighTierLiquidityTrap
-/// @notice Multi-pool, time-weighted, configurable liquidity trap.
-contract HighTierLiquidityTrap is ITrap, Ownable {
+/// @title UltraHighTierLiquidityTrap
+/// @notice Multi-pool, token-agnostic, safe liquidity trap with snapshot collection and rising-edge alerting.
+contract UltraHighTierLiquidityTrap is ITrap, Ownable {
     // ----------------------------------------------------------------------
     // CONFIG
     // ----------------------------------------------------------------------
     struct PoolConfig {
-        address lp;            // LP token address
-        uint256 minDropPercent; // minimum drop % to trigger trap
+        address lp;             // LP token address
+        uint256 minDropBps;     // minimum drop in basis points (1% = 100 bps)
         uint256 lastBalance;    // last recorded LP balance
     }
 
-    // Pools being monitored
     PoolConfig[] public pools;
 
     // Time-weighted parameters
@@ -25,8 +24,11 @@ contract HighTierLiquidityTrap is ITrap, Ownable {
     uint256 public lastCheckTimestamp;
 
     // Alert thresholds
-    uint256 public yellowThreshold = 10; // % drop for yellow alert
-    uint256 public redThreshold = 25;    // % drop for red alert
+    uint256 public yellowBps = 1000; // 10% = 1000 bps
+    uint256 public redBps    = 2500; // 25% = 2500 bps
+
+    // Store last alert % to prevent duplicates (rising-edge)
+    mapping(address => uint256) public lastAlertBps;
 
     // ----------------------------------------------------------------------
     // EVENTS
@@ -34,7 +36,122 @@ contract HighTierLiquidityTrap is ITrap, Ownable {
     event TrapArmed(uint256 poolIndex, uint256 initialBalance);
     event LiquidityAlert(
         uint256 poolIndex,
+        address lp,
         uint256 oldBalance,
+        uint256 newBalance,
+        uint256 percentBps,
+        string severity,
+        uint256 timestamp
+    );
+    event ThresholdsUpdated(uint256 newYellowBps, uint256 newRedBps);
+
+    // ----------------------------------------------------------------------
+    // CONSTRUCTOR
+    // ----------------------------------------------------------------------
+    constructor() {
+        lastCheckTimestamp = block.timestamp;
+    }
+
+    // ----------------------------------------------------------------------
+    // OWNER FUNCTIONS
+    // ----------------------------------------------------------------------
+    function addPool(address _lp, uint256 _minDropBps) external onlyOwner {
+        require(_lp != address(0), "invalid LP");
+        require(_minDropBps > 0 && _minDropBps < 10000, "invalid bps");
+
+        uint256 initialBalance = _safeBalance(_lp);
+        pools.push(PoolConfig(_lp, _minDropBps, initialBalance));
+
+        emit TrapArmed(pools.length - 1, initialBalance);
+    }
+
+    function setCheckInterval(uint256 _seconds) external onlyOwner {
+        require(_seconds >= 10, "too short");
+        checkInterval = _seconds;
+    }
+
+    function setAlertThresholds(uint256 _yellowBps, uint256 _redBps) external onlyOwner {
+        require(_yellowBps < _redBps && _redBps <= 10000, "invalid thresholds");
+        yellowBps = _yellowBps;
+        redBps = _redBps;
+        emit ThresholdsUpdated(_yellowBps, _redBps);
+    }
+
+    // ----------------------------------------------------------------------
+    // VIEW FUNCTIONS
+    // ----------------------------------------------------------------------
+    /// @notice Collect current pool snapshots without reverting
+    function collect() external view returns (bytes[] memory data) {
+        data = new bytes[](pools.length);
+        for (uint256 i = 0; i < pools.length; i++) {
+            PoolConfig storage pool = pools[i];
+            uint256 balance = _safeBalance(pool.lp);
+            data[i] = abi.encode(pool.lp, balance, block.number, block.chainid);
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // CORE TRAP LOGIC
+    // ----------------------------------------------------------------------
+    function trap() external override returns (bool triggered) {
+        if (block.timestamp < lastCheckTimestamp + checkInterval) return false;
+        lastCheckTimestamp = block.timestamp;
+
+        for (uint256 i = 0; i < pools.length; i++) {
+            PoolConfig storage pool = pools[i];
+            uint256 newBalance = _safeBalance(pool.lp);
+            if (newBalance >= pool.lastBalance) continue; // no drop
+
+            uint256 dropBps = ((pool.lastBalance - newBalance) * 10000) / pool.lastBalance;
+
+            // Skip if already alerted last block
+            if (dropBps <= lastAlertBps[pool.lp]) {
+                pool.lastBalance = newBalance;
+                continue;
+            }
+
+            lastAlertBps[pool.lp] = dropBps;
+
+            string memory severity = "GREEN";
+            bool alert = false;
+
+            if (dropBps >= redBps) {
+                severity = "RED";
+                triggered = true;
+                alert = true;
+            } else if (dropBps >= yellowBps) {
+                severity = "YELLOW";
+                alert = true;
+            }
+
+            if (dropBps >= pool.minDropBps && alert) {
+                emit LiquidityAlert(
+                    i,
+                    pool.lp,
+                    pool.lastBalance,
+                    newBalance,
+                    dropBps,
+                    severity,
+                    block.timestamp
+                );
+            }
+
+            pool.lastBalance = newBalance;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // INTERNAL HELPERS
+    // ----------------------------------------------------------------------
+    function _safeBalance(address token) internal view returns (uint256) {
+        if (token.code.length == 0) return 0;
+        try IERC20(token).balanceOf(token) returns (uint256 b) {
+            return b;
+        } catch {
+            return 0;
+        }
+    }
+}        uint256 oldBalance,
         uint256 newBalance,
         uint256 percentDrop,
         string severity,
